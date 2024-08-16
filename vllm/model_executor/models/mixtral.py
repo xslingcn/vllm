@@ -23,6 +23,7 @@
 """Inference-only Mixtral model."""
 from typing import Iterable, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch import nn
 from transformers import MixtralConfig
@@ -30,7 +31,9 @@ from transformers import MixtralConfig
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, LoRAConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
+from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                ReplicatedLinear,
@@ -50,15 +53,59 @@ from vllm.sequence import IntermediateTensors, SamplerOutput
 from .interfaces import SupportsLoRA
 from .utils import is_pp_missing_parameter, make_layers
 
+class MixtralMLP(nn.Module):
+
+    def __init__(
+        self,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
+    ) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        self.ffn_dim = intermediate_size
+        self.hidden_size = hidden_size
+
+        self.w1 = ReplicatedLinear(
+            self.hidden_size,
+            self.ffn_dim,
+            bias=False,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w1",
+        )
+        self.w2 = ReplicatedLinear(
+            self.ffn_dim,
+            self.hidden_size,
+            bias=False,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w2",
+        )
+        self.w3 = ReplicatedLinear(
+            self.hidden_size,
+            self.ffn_dim,
+            bias=False,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w3",
+        )
+
+        self.act_fn = nn.SiLU()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        w1_out, _ = self.w1(hidden_states)
+        w1_out = self.act_fn(w1_out)
+        w3_out, _ = self.w3(hidden_states)
+        current_hidden_states = w1_out * w3_out
+        current_hidden_states, _ = self.w2(current_hidden_states)
+        return current_hidden_states
+
 
 class MixtralMoE(nn.Module):
-    """A tensor-parallel MoE implementation for Mixtral that shards each expert
-    across all ranks.
-
-    Each expert's weights are sharded across all ranks and a fused MoE
-    kernel is used for the forward pass, and finally we reduce the outputs
-    across ranks.
-    """
 
     def __init__(self,
                  num_experts: int,
@@ -67,10 +114,21 @@ class MixtralMoE(nn.Module):
                  intermediate_size: int,
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional[QuantizationConfig] = None,
-                 tp_size: Optional[int] = None,
                  prefix: str = ""):
         super().__init__()
         self.hidden_size = hidden_size
+        self.rank = get_tensor_model_parallel_rank()
+        self.top_k = top_k
+        tp_size = get_tensor_model_parallel_world_size()
+
+        if tp_size > num_experts:
+            raise ValueError(
+                f"Tensor parallel size {tp_size} is greater than "
+                f"the number of experts {num_experts}."
+            )
+        self.expert_indicies = np.array_split(range(num_experts), tp_size)[self.rank].tolist()
+        if not self.expert_indicies:
+            raise ValueError(f"Rank {self.rank} has no experts assigned to it.")
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(hidden_size,
@@ -80,16 +138,23 @@ class MixtralMoE(nn.Module):
                                      quant_config=None,
                                      prefix=f"{prefix}.gate")
 
-        self.experts = FusedMoE(num_experts=num_experts,
-                                top_k=top_k,
-                                hidden_size=hidden_size,
-                                intermediate_size=intermediate_size,
-                                params_dtype=params_dtype,
-                                reduce_results=True,
-                                renormalize=True,
-                                quant_config=quant_config,
-                                tp_size=tp_size,
-                                prefix=f"{prefix}.experts")
+        self.experts = nn.ModuleList(
+            [
+                (
+                    MixtralMLP(
+                        num_experts,
+                        hidden_size,
+                        intermediate_size,
+                        quant_config=quant_config,
+                        params_dtype=params_dtype,
+                        prefix=f"{prefix}.experts",
+                    )
+                    if idx in self.expert_indicies
+                    else None
+                )
+                for idx in range(num_experts)
+            ]
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -97,8 +162,23 @@ class MixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits)
-        return final_hidden_states.view(orig_shape)
+
+        do_normalize = self.top_k > 1
+        topk_weights, topk_ids = fused_topk(hidden_states, router_logits, self.top_k, renormalize=do_normalize)
+
+        final_hidden_states = None
+        for expert_idx in self.expert_indicies:
+            expert_layer = self.experts[expert_idx]
+            expert_mask = topk_ids == expert_idx
+            expert_weights = (topk_weights * expert_mask).sum(dim=-1, keepdim=True)
+
+            current_hidden_states = expert_layer(hidden_states).mul_(expert_weights)
+            if final_hidden_states is None:
+                final_hidden_states = current_hidden_states
+            else:
+                final_hidden_states.add_(current_hidden_states)
+
+        return tensor_model_parallel_all_reduce(final_hidden_states).view(orig_shape)
 
 
 class MixtralAttention(nn.Module):
@@ -411,13 +491,10 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA):
             ("qkv_proj", "v_proj", "v"),
         ]
 
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.num_local_experts)
+        rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        num_experts = self.config.num_local_experts
+        expert_indicies = np.array_split(range(num_experts), tp_size)[rank].tolist()
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
@@ -440,35 +517,24 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    # Skip layers on other devices.
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param,
-                                  loaded_weight,
-                                  weight_name,
-                                  shard_id=shard_id,
-                                  expert_id=expert_id)
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    # Skip layers on other devices.
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    # Remapping the name of FP8 kv-scale.
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip layers on other devices.
+                if is_pp_missing_parameter(name, self):
+                    continue
+                # Remapping the name of FP8 kv-scale.
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+                # Skip experts not assigned to this rank.
+                if "experts" in name:
+                    expert_idx = int(name.split(".")[5])
+                    if expert_idx not in expert_indicies:
                         continue
 
-                    param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
-                    weight_loader(param, loaded_weight)
+                param = params_dict[name]
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
+                weight_loader(param, loaded_weight)
